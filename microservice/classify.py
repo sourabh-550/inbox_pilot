@@ -16,12 +16,16 @@ Classify the email into exactly one of these categories:
 - deadline
 - irrelevant
 
+Note: category should reflect the nature of the action required, not just the topic. An email about a scheduled event with a specific date/time/venue (e.g. an interview drive, mock interview, orientation, or info session) is a "meeting", even if it's related to job placements. Use "job_opportunity" only when the email is about an actual job/internship posting, application process, or offer — not a scheduled event about job-related topics.
+
 Also identify any of these flags that apply (return as a list, can be empty):
 - missing_date: no date/time found, even though the category implies one should exist
 - ambiguous_date: a date-like phrase exists but is vague (e.g. "sometime next week", "TBD")
 - missing_sender_org: cannot tell who the email is actually from
 - vague_subject: the subject line gives little signal about the email's content
 - conflicting_signals: the email content could plausibly fit more than one category
+
+Note: missing_date and ambiguous_date are mutually exclusive — use missing_date only when no date-like phrase exists at all, and ambiguous_date only when one exists but is unclear. Never use both for the same email.
 
 Return a JSON object with exactly these fields:
 {
@@ -35,7 +39,7 @@ Return a JSON object with exactly these fields:
   "flags": list of zero or more flags from the list above
 }
 
-Here are two examples:
+Here are three examples:
 
 Example 1:
 Email subject: Interview Invitation - TechCorp
@@ -50,7 +54,13 @@ Email body: Here are this week's top 5 stories in AI and software development...
 Sender: newsletter@techdigest.com
 Output:
 {"category": "irrelevant", "source_name": "TechDigest", "item_title": "Weekly Tech Digest", "event_date": null, "location_or_link": null, "priority": "low", "summary": "A newsletter with weekly tech news roundup, not actionable.", "flags": []}
-Note: missing_date and ambiguous_date are mutually exclusive — use missing_date only when no date-like phrase exists at all, and ambiguous_date only when one exists but is unclear. Never use both for the same email.
+
+Example 3:
+Email subject: Mock Interview Drive for Final Year Students
+Email body: A Mock Interview Drive will be conducted on August 1st at 9:15 AM in the Auditorium to prepare students for campus placements.
+Sender: placement@college.edu
+Output:
+{"category": "meeting", "source_name": "College Placement Cell", "item_title": "Mock Interview Drive", "event_date": "2026-08-01T09:15:00", "location_or_link": "Auditorium", "priority": "high", "summary": "The placement cell scheduled a mock interview drive on August 1st at 9:15 AM in the Auditorium to prepare students for campus placements.", "flags": []}
 """
 def classify_email(subject: str, body: str, sender: str, attachment_text: str = None):
     user_content = f"Email subject: {subject}\nEmail body: {body}\nSender: {sender}"
