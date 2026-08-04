@@ -41,8 +41,8 @@ Inboxes fill up with a mix of things that matter and things that don't. Reading 
 - [x] Project scaffold
 - [x] Email classification + structured extraction (Groq, tested against multiple real cases)
 - [x] Confidence scoring — computed from AI-flagged uncertainty, not self-reported by the model
-- [ ] Attachment parsing (PDF/DOCX)
-- [ ] Notion integration
+- [x] Attachment parsing (PDF/DOCX)
+- [x] Notion integration
 - [ ] Calendar integration + conflict detection
 - [ ] Telegram notifications
 - [ ] n8n workflow wiring
