@@ -12,6 +12,7 @@ from notion import find_or_create_source, create_item
 from timezone_utils import to_ist
 from calendar_utils import create_event_with_conflict_check
 from telegram_utils import send_telegram_message
+from dedup import compute_fingerprint, is_duplicate, mark_processed
 
 app = FastAPI()
 
@@ -22,6 +23,7 @@ class EmailInput(BaseModel):
     body: str
     sender: str
     attachment_text: Optional[str] = None
+    gmail_message_id: Optional[str] = None
 
 
 def save_to_notion(result: dict, sender: str):
@@ -97,6 +99,13 @@ def try_schedule_event(result: dict):
 
 @app.post("/process")
 def process_email(email: EmailInput):
+    email_id = email.gmail_message_id or compute_fingerprint(
+        email.subject, email.sender, email.body
+    )
+
+    if is_duplicate(email_id):
+        return {"status": "duplicate_skipped", "email_id": email_id}
+
     result = classify_email(
         subject=email.subject,
         body=email.body,
@@ -120,6 +129,8 @@ def process_email(email: EmailInput):
     calendar_result = try_schedule_event(result)
     result.update(calendar_result)
 
+    mark_processed(email_id)
+
     return result
 
 
@@ -128,8 +139,14 @@ def process_email_with_attachment(
     subject: str,
     body: str,
     sender: str,
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    gmail_message_id: str = None
 ):
+    email_id = gmail_message_id or compute_fingerprint(subject, sender, body)
+
+    if is_duplicate(email_id):
+        return {"status": "duplicate_skipped", "email_id": email_id}
+
     temp_path = f"temp_{file.filename}"
     with open(temp_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
@@ -160,5 +177,7 @@ def process_email_with_attachment(
 
     calendar_result = try_schedule_event(result)
     result.update(calendar_result)
+
+    mark_processed(email_id)
 
     return result
