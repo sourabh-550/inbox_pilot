@@ -9,3 +9,4 @@ google-auth-oauthlib
 sentence-transformers
 python-dotenv
 tenacity
+tzdata

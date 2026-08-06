@@ -84,3 +84,69 @@ def create_item(
         properties=properties
     )
     return new_item["id"]
+
+
+def get_todays_items(start_iso: str, end_iso: str) -> list:
+    """
+    Fetches all Items created between start_iso and end_iso (both ISO 8601
+    strings with timezone offset, e.g. "2026-08-06T00:00:00+05:30").
+    Uses the "Created time" property (Notion-native timestamp), which is
+    filtered differently from a regular Date property — it needs the
+    top-level "timestamp": "created_time" filter shape, not a
+    property-name-based filter.
+    """
+    results = []
+    cursor = None
+
+    while True:
+        query_args = {
+            "data_source_id": ITEMS_DATA_SOURCE_ID,
+            "filter": {
+                "and": [
+                    {
+                        "timestamp": "created_time",
+                        "created_time": {"on_or_after": start_iso}
+                    },
+                    {
+                        "timestamp": "created_time",
+                        "created_time": {"before": end_iso}
+                    }
+                ]
+            }
+        }
+        if cursor:
+            query_args["start_cursor"] = cursor
+
+        response = notion.data_sources.query(**query_args)
+        results.extend(response["results"])
+
+        if response.get("has_more"):
+            cursor = response.get("next_cursor")
+        else:
+            break
+
+    items = []
+    for page in results:
+        props = page["properties"]
+
+        def get_title(p):
+            arr = p.get("Title", {}).get("title", [])
+            return arr[0]["plain_text"] if arr else "Untitled"
+
+        def get_select(p, name):
+            sel = p.get(name, {}).get("select")
+            return sel["name"] if sel else None
+
+        def get_date(p, name):
+            d = p.get(name, {}).get("date")
+            return d["start"] if d else None
+
+        items.append({
+            "title": get_title(props),
+            "category": get_select(props, "category"),
+            "status": get_select(props, "status"),
+            "priority": get_select(props, "priority"),
+            "event_date": get_date(props, "event_date"),
+        })
+
+    return items
