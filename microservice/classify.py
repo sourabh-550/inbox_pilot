@@ -11,6 +11,18 @@ client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 LOCAL_TZ = ZoneInfo("Asia/Kolkata")
 
+
+class ClassificationError(Exception):
+    """
+    Raised when the LLM's response can't be parsed as the expected JSON
+    object, or when the Groq call itself fails. Callers should catch this
+    and decide how to handle an email that couldn't be classified, rather
+    than letting it crash the request as an unhandled 500.
+    """
+    def __init__(self, message: str, raw_output: str = None):
+        super().__init__(message)
+        self.raw_output = raw_output
+
 SYSTEM_PROMPT_TEMPLATE = """You are an email classification and extraction assistant.
 Your job is to read an email (and optional attachment text) and return ONLY a JSON object — no explanation, no markdown formatting, no extra text.
 
@@ -83,14 +95,44 @@ def classify_email(subject: str, body: str, sender: str, attachment_text: str = 
     if attachment_text:
         user_content += f"\nAttachment text: {attachment_text}"
 
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content}
-        ],
-        temperature=0
-    )
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ],
+            temperature=0,
+            response_format={"type": "json_object"}
+        )
+    except Exception as e:
+        raise ClassificationError(f"Groq API call failed: {e}")
 
     raw_output = response.choices[0].message.content
-    return json.loads(raw_output)
+
+    try:
+        return json.loads(raw_output)
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Fallback: model ignored instructions and wrapped the JSON in a
+    # ```json ... ``` fence (or added stray text around it). Try to
+    # salvage just the JSON object before giving up.
+    if raw_output:
+        stripped = raw_output.strip()
+        if stripped.startswith("```"):
+            stripped = stripped.strip("`")
+            if stripped.lower().startswith("json"):
+                stripped = stripped[4:]
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(stripped[start:end + 1])
+            except json.JSONDecodeError:
+                pass
+
+    raise ClassificationError(
+        "Could not parse a valid JSON object from the model's response",
+        raw_output=raw_output
+    )
