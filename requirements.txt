@@ -6,7 +6,8 @@ python-docx
 notion-client
 google-api-python-client
 google-auth-oauthlib
-sentence-transformers
 python-dotenv
 tenacity
+sqlalchemy
+psycopg2-binary
 tzdata
