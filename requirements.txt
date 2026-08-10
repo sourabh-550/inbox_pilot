@@ -11,3 +11,4 @@ tenacity
 sqlalchemy
 psycopg2-binary
 tzdata
+python-multipart
