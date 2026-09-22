@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-groq
+groq>=1.6.0
 pdfplumber
 python-docx
 notion-client

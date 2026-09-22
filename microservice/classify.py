@@ -11,6 +11,10 @@ client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 LOCAL_TZ = ZoneInfo("Asia/Kolkata")
 
+# gpt-oss is a reasoning model: don't add a small max_tokens cap, or the
+# reasoning can use it up before any JSON is written.
+GROQ_MODEL = os.environ.get("GROQ_MODEL") or "openai/gpt-oss-120b"
+
 
 class ClassificationError(Exception):
     """
@@ -109,18 +113,20 @@ def classify_email(subject: str, body: str, sender: str, attachment_text: str = 
 
     try:
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=GROQ_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content}
             ],
             temperature=0,
+            reasoning_effort="low",
             response_format={"type": "json_object"}
         )
     except Exception as e:
-        raise ClassificationError(f"Groq API call failed: {e}")
+        raise ClassificationError(f"Groq API call failed (model {GROQ_MODEL}): {e}")
 
     raw_output = response.choices[0].message.content
+    finish_reason = response.choices[0].finish_reason
 
     try:
         return json.loads(raw_output)
@@ -145,6 +151,7 @@ def classify_email(subject: str, body: str, sender: str, attachment_text: str = 
                 pass
 
     raise ClassificationError(
-        "Could not parse a valid JSON object from the model's response",
+        f"Could not parse a valid JSON object from the model's response "
+        f"(model {GROQ_MODEL}, finish_reason {finish_reason})",
         raw_output=raw_output
     )
