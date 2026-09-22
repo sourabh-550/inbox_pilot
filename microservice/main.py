@@ -16,8 +16,8 @@ from notion import (
     find_or_create_source, create_item, update_item_status, get_todays_items,
     STATUS_SCHEDULED, STATUS_NEEDS_REVIEW, STATUS_CONFLICT, STATUS_LOGGED_ONLY,
 )
-from timezone_utils import to_ist
-from calendar_utils import create_event_with_conflict_check
+from timezone_utils import to_ist, is_date_only
+from calendar_utils import create_event_with_conflict_check, create_all_day_event
 from telegram_utils import send_telegram_message, escape_markdown
 from dedup import compute_fingerprint, claim, mark_done, release, DedupUnavailableError
 
@@ -200,6 +200,17 @@ def try_schedule_event(result: dict):
         return {"calendar_status": "skipped_low_confidence"}
 
     try:
+        # Date-only items (typically deadlines) become a transparent all-day
+        # event: it doesn't block the day, so there's no conflict check.
+        if is_date_only(event_date):
+            link = create_all_day_event(
+                summary=result.get("item_title", "Untitled"),
+                date_str=event_date,
+                location=result.get("location_or_link") or "",
+                description=result.get("summary", "")
+            )
+            return {"calendar_status": "scheduled", "calendar_link": link}
+
         # naive 1-hour duration assumption, since we only extract a start time for now
         start = datetime.fromisoformat(event_date)
         end = start + timedelta(hours=1)
@@ -274,6 +285,18 @@ def run_pipeline(
             "error": str(e)
         }
 
+    # Normalize the date before scoring, so an unparseable date can lower
+    # the confidence score instead of breaking the Notion write later.
+    raw = result.get("event_date")
+    try:
+        result["event_date"] = to_ist(raw)
+    except ValueError:
+        logger.warning(f"Unparseable event_date {raw!r} for '{subject}' from {sender}, treating as no date")
+        result["event_date"] = None
+        flags = result.setdefault("flags", [])
+        if "missing_date" not in flags and "ambiguous_date" not in flags:
+            flags.append("ambiguous_date")
+
     result["confidence_score"] = compute_confidence(
         flags=result.get("flags", []),
         attachment_unparsed=attachment_unparsed
@@ -283,8 +306,6 @@ def run_pipeline(
 
     if result["confidence_score"] < CONFIDENCE_THRESHOLD:
         send_low_confidence_alert(result)
-
-    result["event_date"] = to_ist(result.get("event_date"))
 
     notion_status = initial_notion_status(result)
 
@@ -464,7 +485,9 @@ def format_digest_message(items: list, digest_date: str) -> str:
             if event_date:
                 try:
                     dt = datetime.fromisoformat(event_date)
-                    date_str = dt.strftime("%b %d, %I:%M %p")
+                    # Date-only items have no time, so don't show "12:00 AM"
+                    fmt = "%b %d" if is_date_only(event_date) else "%b %d, %I:%M %p"
+                    date_str = dt.strftime(fmt)
                     lines.append(f"  • {title} — {date_str}")
                 except ValueError:
                     lines.append(f"  • {title}")

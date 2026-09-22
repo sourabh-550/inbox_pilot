@@ -51,14 +51,19 @@ Return a JSON object with exactly these fields:
   "category": one of the four categories above,
   "source_name": string,
   "item_title": string,
-  "event_date": ISO 8601 string or null,
+  "event_date": "YYYY-MM-DDTHH:MM:SS" or "YYYY-MM-DD" or null (see rules below),
   "location_or_link": string or null,
   "priority": "high", "medium", or "low",
   "summary": short 1-2 sentence string,
   "flags": list of zero or more flags from the list above
 }}
 
-Here are three examples:
+Rules for event_date:
+- If the email gives both a date and a time, return "YYYY-MM-DDTHH:MM:SS" in IST, with no timezone offset.
+- If the email gives only a date and no time (common for deadlines, e.g. "submit by August 5th"), return "YYYY-MM-DD". Never invent a time such as 00:00 or 23:59.
+- If the email gives no date at all, return null.
+
+Here are four examples:
 
 Example 1:
 Email subject: Interview Invitation - TechCorp
@@ -80,6 +85,13 @@ Email body: A Mock Interview Drive will be conducted on August 1st at 9:15 AM in
 Sender: placement@college.edu
 Output:
 {{"category": "meeting", "source_name": "College Placement Cell", "item_title": "Mock Interview Drive", "event_date": "2026-08-01T09:15:00", "location_or_link": "Auditorium", "priority": "high", "summary": "The placement cell scheduled a mock interview drive on August 1st at 9:15 AM in the Auditorium to prepare students for campus placements.", "flags": []}}
+
+Example 4:
+Email subject: Final Project Report Submission
+Email body: Please submit your final project report through the course portal by August 5th.
+Sender: professor@college.edu
+Output:
+{{"category": "deadline", "source_name": "College Faculty", "item_title": "Final Project Report Submission", "event_date": "2026-08-05", "location_or_link": "Course portal", "priority": "high", "summary": "The final project report must be submitted through the course portal by August 5th.", "flags": []}}
 
 Note: the dates in the examples above are illustrative only. They do NOT represent the current date. Always use the current date/time given at the top of this prompt to resolve any relative date language in the actual email you are classifying.
 """

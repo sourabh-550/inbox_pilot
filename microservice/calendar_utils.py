@@ -1,4 +1,5 @@
 import os
+from datetime import date, timedelta
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -73,6 +74,30 @@ def create_calendar_event(summary: str, start_datetime: str, end_datetime: str, 
             "dateTime": end_datetime,
             "timeZone": "Asia/Kolkata",
         },
+    }
+
+    created_event = service.events().insert(calendarId="primary", body=event).execute()
+    return created_event.get("htmlLink")
+
+
+def create_all_day_event(summary: str, date_str: str, location: str = "", description: str = ""):
+    """
+    Creates an all-day event for a date-only item (e.g. a deadline) and
+    returns its link. Marked transparent ("free") so it doesn't block the
+    day, which is also why there's no conflict check.
+    """
+    service = get_calendar_service()
+
+    # Google treats an all-day event's end date as exclusive.
+    end_date = (date.fromisoformat(date_str) + timedelta(days=1)).isoformat()
+
+    event = {
+        "summary": summary,
+        "location": location,
+        "description": description,
+        "start": {"date": date_str},
+        "end": {"date": end_date},
+        "transparency": "transparent",
     }
 
     created_event = service.events().insert(calendarId="primary", body=event).execute()
