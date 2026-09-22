@@ -5,3 +5,5 @@ __pycache__/
 .env.example
 credentials.json
 token.json
+CLAUDE.md
+explanation.md
