@@ -12,7 +12,10 @@ from zoneinfo import ZoneInfo
 from classify import classify_email, ClassificationError
 from confidence import compute_confidence
 from attachments import extract_attachment_text
-from notion import find_or_create_source, create_item, get_todays_items
+from notion import (
+    find_or_create_source, create_item, update_item_status, get_todays_items,
+    STATUS_SCHEDULED, STATUS_NEEDS_REVIEW, STATUS_CONFLICT, STATUS_LOGGED_ONLY,
+)
 from timezone_utils import to_ist
 from calendar_utils import create_event_with_conflict_check
 from telegram_utils import send_telegram_message, escape_markdown
@@ -40,13 +43,54 @@ class EmailInput(BaseModel):
     attachments: List[AttachmentInput] = []
 
 
-def save_to_notion(result: dict, sender: str):
+def initial_notion_status(result: dict) -> str:
+    """
+    Status written with the Notion item, before the calendar step runs.
+    A dated, confident item starts as "Needs review" and is only promoted
+    once the calendar outcome is known (see sync_notion_status), so a crash
+    or calendar failure never leaves it wrongly marked "Scheduled".
+    """
+    if result.get("confidence_score", 0.0) < CONFIDENCE_THRESHOLD:
+        return STATUS_NEEDS_REVIEW
+    if not result.get("event_date"):
+        return STATUS_LOGGED_ONLY
+    return STATUS_NEEDS_REVIEW
+
+
+CALENDAR_TO_NOTION_STATUS = {
+    "scheduled": STATUS_SCHEDULED,
+    "conflict": STATUS_CONFLICT,
+}
+
+
+def sync_notion_status(page_id: str, calendar_status: str, current: str) -> str:
+    """
+    Updates the Notion item's status from the calendar outcome and returns
+    the status actually stored. Only "scheduled" and "conflict" change it.
+    Best-effort: on failure the item keeps its current status ("Needs
+    review"), which is logged but not alerted on.
+    """
+    new_status = CALENDAR_TO_NOTION_STATUS.get(calendar_status)
+    if new_status is None:
+        return current
+
+    try:
+        update_item_status(page_id, new_status)
+    except Exception as e:
+        logger.error(f"Notion status update to '{new_status}' failed for page {page_id}: {e}")
+        return current
+
+    return new_status
+
+
+def save_to_notion(result: dict, sender: str, status: str):
     source_id = find_or_create_source(result.get("source_name", "Unknown"))
 
     item_id = create_item(
         title=result.get("item_title", "Untitled"),
         source_page_id=source_id,
         category=result.get("category", "irrelevant"),
+        status=status,
         event_date=result.get("event_date"),
         priority=result.get("priority", "medium"),
         location_or_link=result.get("location_or_link") or "",
@@ -242,8 +286,10 @@ def run_pipeline(
 
     result["event_date"] = to_ist(result.get("event_date"))
 
+    notion_status = initial_notion_status(result)
+
     try:
-        notion_item_id = save_to_notion(result, sender)
+        notion_item_id = save_to_notion(result, sender, notion_status)
     except Exception as e:
         logger.error(f"Notion write failed for '{subject}' from {sender}: {e}")
         send_telegram_message(
@@ -272,6 +318,10 @@ def run_pipeline(
 
     calendar_result = try_schedule_event(result)
     result.update(calendar_result)
+
+    result["notion_status"] = sync_notion_status(
+        notion_item_id, calendar_result["calendar_status"], notion_status
+    )
 
     return result
 

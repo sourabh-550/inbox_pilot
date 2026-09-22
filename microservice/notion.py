@@ -9,6 +9,15 @@ notion = Client(auth=os.environ.get("NOTION_TOKEN"))
 SOURCES_DB_ID = os.environ.get("NOTION_SOURCES_DB_ID")
 ITEMS_DB_ID = os.environ.get("NOTION_ITEMS_DB_ID")
 
+# Options of the Items "status" select. Must match Notion exactly: the API
+# silently creates a new option for an unknown name instead of failing, so
+# every write goes through these constants and is checked against the set.
+STATUS_SCHEDULED = "Scheduled"
+STATUS_NEEDS_REVIEW = "Needs review"
+STATUS_CONFLICT = "Conflict"
+STATUS_LOGGED_ONLY = "Logged only"
+ITEM_STATUSES = {STATUS_SCHEDULED, STATUS_NEEDS_REVIEW, STATUS_CONFLICT, STATUS_LOGGED_ONLY}
+
 
 def get_data_source_id(database_id: str) -> str:
     db = notion.databases.retrieve(database_id=database_id)
@@ -42,10 +51,16 @@ def find_or_create_source(name: str) -> str:
     return new_source["id"]
 
 
+def _check_status(status: str):
+    if status not in ITEM_STATUSES:
+        raise ValueError(f"Unknown Notion item status: {status!r}")
+
+
 def create_item(
     title: str,
     source_page_id: str,
     category: str,
+    status: str,
     event_date: str = None,
     priority: str = "Medium",
     location_or_link: str = "",
@@ -61,7 +76,7 @@ def create_item(
         "irrelevant": "Other"
     }
 
-    status = "Scheduled" if event_date else "Logged only"
+    _check_status(status)
 
     properties = {
         "Title": {"title": [{"text": {"content": title}}]},
@@ -84,6 +99,14 @@ def create_item(
         properties=properties
     )
     return new_item["id"]
+
+
+def update_item_status(page_id: str, status: str):
+    _check_status(status)
+    notion.pages.update(
+        page_id=page_id,
+        properties={"status": {"select": {"name": status}}}
+    )
 
 
 def get_todays_items(start_iso: str, end_iso: str) -> list:
