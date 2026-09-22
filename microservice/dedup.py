@@ -1,4 +1,5 @@
 import os
+import uuid
 import hashlib
 import logging
 from sqlalchemy import create_engine, text
@@ -8,6 +9,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 logger = logging.getLogger("inboxpilot.dedup")
+
+# How long a 'processing' claim is honoured before another request may take
+# it over (e.g. the original request crashed without releasing its claim).
+STALE_CLAIM_MINUTES = 10
+
+# Run at the start of every transaction: connect_timeout only covers opening
+# the connection, so without this a query that stalls after connecting could
+# still hang the request.
+STATEMENT_TIMEOUT_SQL = "SET LOCAL statement_timeout = '5s'"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
@@ -42,30 +52,87 @@ def compute_fingerprint(subject: str, sender: str, body: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def is_duplicate(email_id: str) -> bool:
-    try:
-        with engine.connect() as conn:
-            result = conn.execute(
-                text("SELECT 1 FROM inboxpilot_v1_dedup WHERE email_id = :email_id"),
-                {"email_id": email_id}
-            )
-            return result.fetchone() is not None
-    except (OperationalError, SQLAlchemyError) as e:
-        logger.error(f"Dedup check failed for {email_id}: {e}")
-        raise DedupUnavailableError(f"Could not check for duplicate: {e}")
+def claim(email_id: str) -> str | None:
+    """
+    Atomically claims an email for processing. Returns a claim token if this
+    request now owns the email, or None if it is already done or another
+    request is actively processing it (i.e. skip as a duplicate).
 
-
-def mark_processed(email_id: str):
+    A single INSERT ... ON CONFLICT statement does the check and the write,
+    so two concurrent requests for the same email can't both win. An
+    existing 'processing' row older than STALE_CLAIM_MINUTES is taken over
+    with a fresh token, which makes the old owner's mark_done/release no-ops.
+    """
+    token = str(uuid.uuid4())
     try:
-        with engine.connect() as conn:
-            conn.execute(
+        with engine.begin() as conn:
+            conn.execute(text(STATEMENT_TIMEOUT_SQL))
+            row = conn.execute(
                 text(
-                    "INSERT INTO inboxpilot_v1_dedup (email_id) VALUES (:email_id) "
-                    "ON CONFLICT (email_id) DO NOTHING"
+                    "INSERT INTO inboxpilot_v1_dedup (email_id, status, claimed_at, claim_token) "
+                    "VALUES (:email_id, 'processing', now(), :token) "
+                    "ON CONFLICT (email_id) DO UPDATE "
+                    "SET claimed_at = now(), claim_token = EXCLUDED.claim_token "
+                    "WHERE inboxpilot_v1_dedup.status = 'processing' "
+                    "AND inboxpilot_v1_dedup.claimed_at < now() - make_interval(mins => :stale_minutes) "
+                    "RETURNING claim_token"
                 ),
-                {"email_id": email_id}
-            )
-            conn.commit()
+                {"email_id": email_id, "token": token, "stale_minutes": STALE_CLAIM_MINUTES}
+            ).fetchone()
     except (OperationalError, SQLAlchemyError) as e:
-        logger.error(f"Failed to mark {email_id} as processed: {e}")
-        raise DedupUnavailableError(f"Could not mark email as processed: {e}")
+        logger.error(f"Dedup claim failed for {email_id}: {e}")
+        raise DedupUnavailableError(f"Could not claim email: {e}")
+
+    return token if row is not None else None
+
+
+def mark_done(email_id: str, token: str):
+    """
+    Marks a claimed email as fully processed. Only succeeds if this request
+    still owns the claim; otherwise logs a warning and does nothing.
+    """
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(STATEMENT_TIMEOUT_SQL))
+            result = conn.execute(
+                text(
+                    "UPDATE inboxpilot_v1_dedup "
+                    "SET status = 'done', processed_at = now() "
+                    "WHERE email_id = :email_id AND claim_token = :token "
+                    "AND status = 'processing'"
+                ),
+                {"email_id": email_id, "token": token}
+            )
+            rowcount = result.rowcount
+    except (OperationalError, SQLAlchemyError) as e:
+        logger.error(f"Failed to mark {email_id} as done: {e}")
+        raise DedupUnavailableError(f"Could not mark email as done: {e}")
+
+    if rowcount == 0:
+        logger.warning(f"mark_done: lost ownership of {email_id} (claim taken over or removed)")
+
+
+def release(email_id: str, token: str):
+    """
+    Drops this request's claim so the email can be retried later. Only
+    deletes a row that this request still owns and that is still
+    'processing', so it can never undo a finished email.
+    """
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(STATEMENT_TIMEOUT_SQL))
+            result = conn.execute(
+                text(
+                    "DELETE FROM inboxpilot_v1_dedup "
+                    "WHERE email_id = :email_id AND claim_token = :token "
+                    "AND status = 'processing'"
+                ),
+                {"email_id": email_id, "token": token}
+            )
+            rowcount = result.rowcount
+    except (OperationalError, SQLAlchemyError) as e:
+        logger.error(f"Failed to release claim on {email_id}: {e}")
+        raise DedupUnavailableError(f"Could not release claim: {e}")
+
+    if rowcount == 0:
+        logger.warning(f"release: lost ownership of {email_id} (claim taken over or removed)")

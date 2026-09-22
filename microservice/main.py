@@ -16,7 +16,7 @@ from notion import find_or_create_source, create_item, get_todays_items
 from timezone_utils import to_ist
 from calendar_utils import create_event_with_conflict_check
 from telegram_utils import send_telegram_message, escape_markdown
-from dedup import compute_fingerprint, is_duplicate, mark_processed
+from dedup import compute_fingerprint, claim, mark_done, release, DedupUnavailableError
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("inboxpilot.main")
@@ -84,6 +84,61 @@ def send_classification_failed_alert(subject: str, sender: str, error: str):
     )
 
 
+def send_dedup_warning(stage: str, email_id: str, error: str, consequence: str):
+    send_telegram_message(
+        f"⚠️ *Dedup Database Error*\n\n"
+        f"Stage: {escape_markdown(stage)}\n"
+        f"Email ID: {escape_markdown(email_id)}\n"
+        f"Error: {escape_markdown(error)}\n\n"
+        f"{consequence}"
+    )
+
+
+def acquire_claim(email_id: str) -> tuple[bool, Optional[str]]:
+    """
+    Returns (skip, claim_token). skip=True means another request already
+    processed or is processing this email. If the dedup DB is unreachable we
+    fail open: process anyway with claim_token=None, which makes the later
+    mark_done/release calls no-ops for this request.
+    """
+    try:
+        claim_token = claim(email_id)
+    except DedupUnavailableError as e:
+        logger.error(f"Dedup unavailable, processing {email_id} without duplicate protection: {e}")
+        send_dedup_warning(
+            "claim", email_id, str(e),
+            "Processing this email anyway, without duplicate protection."
+        )
+        return False, None
+
+    return claim_token is None, claim_token
+
+
+def safe_mark_done(email_id: str, claim_token: Optional[str]):
+    if claim_token is None:
+        return
+    try:
+        mark_done(email_id, claim_token)
+    except DedupUnavailableError as e:
+        send_dedup_warning(
+            "mark done", email_id, str(e),
+            "The item was saved to Notion, but a retry of this email may create a duplicate."
+        )
+
+
+def safe_release(email_id: str, claim_token: Optional[str]):
+    if claim_token is None:
+        return
+    try:
+        release(email_id, claim_token)
+    except DedupUnavailableError as e:
+        send_dedup_warning(
+            "release", email_id, str(e),
+            "The claim could not be released, so retries of this email will be "
+            "skipped as duplicates until the claim goes stale."
+        )
+
+
 def try_schedule_event(result: dict):
     """
     Returns a dict describing what happened: scheduled, conflict, skipped, or error.
@@ -137,6 +192,7 @@ def try_schedule_event(result: dict):
 
 def run_pipeline(
     email_id: str,
+    claim_token: Optional[str],
     subject: str,
     body: str,
     sender: str,
@@ -145,13 +201,15 @@ def run_pipeline(
 ) -> dict:
     """
     Shared pipeline logic for both /process and /process_with_attachment,
-    used from the point right after attachment extraction.
+    used from the point right after attachment extraction. The caller has
+    already claimed the email (claim_token is None if dedup was unavailable).
 
-    Key ordering fix: mark_processed() now runs immediately after the
-    Notion write succeeds, NOT after Calendar/Telegram too. Those two are
-    best-effort and individually wrapped, so a Calendar or Telegram hiccup
-    can no longer cause the email to be left "unprocessed" and reprocessed
-    into a duplicate Notion item on a retry.
+    Key ordering: mark_done() runs immediately after the Notion write
+    succeeds, NOT after Calendar/Telegram too. Those two are best-effort and
+    individually wrapped, so a Calendar or Telegram hiccup can't cause the
+    email to be left "unprocessed" and reprocessed into a duplicate Notion
+    item on a retry. If classification or the Notion write fails, the claim
+    is released so a retry can succeed.
     """
     try:
         result = classify_email(
@@ -163,9 +221,9 @@ def run_pipeline(
     except ClassificationError as e:
         logger.error(f"Classification failed for '{subject}' from {sender}: {e}")
         send_classification_failed_alert(subject, sender, str(e))
-        # Deliberately NOT marking this email as processed: nothing was
-        # saved anywhere, so it's safe (and desirable) for this to be
-        # retried rather than silently lost.
+        # Releasing the claim: nothing was saved anywhere, so it's safe
+        # (and desirable) for this to be retried rather than silently lost.
+        safe_release(email_id, claim_token)
         return {
             "status": "classification_failed",
             "email_id": email_id,
@@ -195,8 +253,9 @@ def run_pipeline(
             f"Error: {escape_markdown(str(e))}\n\n"
             f"Nothing was saved for this email. It's safe to retry."
         )
-        # Not marking as processed: nothing was actually saved, so a retry
+        # Releasing the claim: nothing was actually saved, so a retry
         # (rather than silent data loss) is the correct outcome here.
+        safe_release(email_id, claim_token)
         return {
             "status": "notion_write_failed",
             "email_id": email_id,
@@ -206,9 +265,10 @@ def run_pipeline(
     result["notion_item_id"] = notion_item_id
 
     # From this point on, a real Notion record exists. Mark the email as
-    # processed now so that any downstream (Calendar/Telegram) failure
-    # can't cause a re-processed duplicate Notion item on retry.
-    mark_processed(email_id)
+    # done now so that any downstream (Calendar/Telegram) failure can't
+    # cause a re-processed duplicate Notion item on retry. A dedup DB error
+    # here is alerted on but doesn't stop the calendar step.
+    safe_mark_done(email_id, claim_token)
 
     calendar_result = try_schedule_event(result)
     result.update(calendar_result)
@@ -222,47 +282,56 @@ def process_email(email: EmailInput):
         email.subject, email.sender, email.body
     )
 
-    if is_duplicate(email_id):
+    skip, claim_token = acquire_claim(email_id)
+    if skip:
         return {"status": "duplicate_skipped", "email_id": email_id}
 
-    # Decode and extract text from any attachments
-    attachment_texts = []
-    attachment_unparsed = False
+    # Any unexpected exception releases the claim so the email can be
+    # retried. After the Notion write, mark_done has already set the row to
+    # 'done', so release is a no-op there and can't undo a saved email.
+    try:
+        # Decode and extract text from any attachments
+        attachment_texts = []
+        attachment_unparsed = False
 
-    for att in email.attachments:
-        temp_path = None
-        try:
-            file_bytes = base64.b64decode(att.data_base64)
-            # NOTE: still using a filename-based temp path here (not fixed
-            # in this pass — see the attachment race-condition/leak items
-            # from the review; flagging as a follow-up fix).
-            temp_path = f"temp_{att.filename}"
-            with open(temp_path, "wb") as f:
-                f.write(file_bytes)
+        for att in email.attachments:
+            temp_path = None
+            try:
+                file_bytes = base64.b64decode(att.data_base64)
+                # NOTE: still using a filename-based temp path here (not fixed
+                # in this pass — see the attachment race-condition/leak items
+                # from the review; flagging as a follow-up fix).
+                temp_path = f"temp_{att.filename}"
+                with open(temp_path, "wb") as f:
+                    f.write(file_bytes)
 
-            text, unparsed = extract_attachment_text(temp_path)
+                text, unparsed = extract_attachment_text(temp_path)
 
-            if unparsed:
+                if unparsed:
+                    attachment_unparsed = True
+                if text:
+                    attachment_texts.append(f"[{att.filename}]\n{text}")
+            except Exception as e:
                 attachment_unparsed = True
-            if text:
-                attachment_texts.append(f"[{att.filename}]\n{text}")
-        except Exception as e:
-            attachment_unparsed = True
-            logger.error(f"Failed to process attachment {att.filename}: {e}")
-        finally:
-            if temp_path and os.path.exists(temp_path):
-                os.remove(temp_path)
+                logger.error(f"Failed to process attachment {att.filename}: {e}")
+            finally:
+                if temp_path and os.path.exists(temp_path):
+                    os.remove(temp_path)
 
-    combined_attachment_text = "\n\n".join(attachment_texts) if attachment_texts else None
+        combined_attachment_text = "\n\n".join(attachment_texts) if attachment_texts else None
 
-    return run_pipeline(
-        email_id=email_id,
-        subject=email.subject,
-        body=email.body,
-        sender=email.sender,
-        attachment_text=combined_attachment_text,
-        attachment_unparsed=attachment_unparsed
-    )
+        return run_pipeline(
+            email_id=email_id,
+            claim_token=claim_token,
+            subject=email.subject,
+            body=email.body,
+            sender=email.sender,
+            attachment_text=combined_attachment_text,
+            attachment_unparsed=attachment_unparsed
+        )
+    except Exception:
+        safe_release(email_id, claim_token)
+        raise
 
 
 @app.post("/process_with_attachment")
@@ -275,29 +344,36 @@ def process_email_with_attachment(
 ):
     email_id = gmail_message_id or compute_fingerprint(subject, sender, body)
 
-    if is_duplicate(email_id):
+    skip, claim_token = acquire_claim(email_id)
+    if skip:
         return {"status": "duplicate_skipped", "email_id": email_id}
 
-    temp_path = f"temp_{file.filename}"
-    attachment_text, attachment_unparsed = "", True
+    # See process_email: release the claim on any unexpected exception.
     try:
-        with open(temp_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        attachment_text, attachment_unparsed = extract_attachment_text(temp_path)
-    except Exception as e:
-        logger.error(f"Failed to process attachment {file.filename}: {e}")
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        temp_path = f"temp_{file.filename}"
+        attachment_text, attachment_unparsed = "", True
+        try:
+            with open(temp_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+            attachment_text, attachment_unparsed = extract_attachment_text(temp_path)
+        except Exception as e:
+            logger.error(f"Failed to process attachment {file.filename}: {e}")
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
-    return run_pipeline(
-        email_id=email_id,
-        subject=subject,
-        body=body,
-        sender=sender,
-        attachment_text=attachment_text if attachment_text else None,
-        attachment_unparsed=attachment_unparsed
-    )
+        return run_pipeline(
+            email_id=email_id,
+            claim_token=claim_token,
+            subject=subject,
+            body=body,
+            sender=sender,
+            attachment_text=attachment_text if attachment_text else None,
+            attachment_unparsed=attachment_unparsed
+        )
+    except Exception:
+        safe_release(email_id, claim_token)
+        raise
 
 
 CATEGORY_LABELS = {
