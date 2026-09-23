@@ -1,17 +1,16 @@
 import base64
+import io
 import logging
 
 from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
 from typing import Optional, List
-import shutil
-import os
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from classify import classify_email, ClassificationError
 from confidence import compute_confidence
-from attachments import extract_attachment_text
+from attachments import save_and_extract
 from notion import (
     find_or_create_source, create_item, update_item_status, get_todays_items,
     STATUS_SCHEDULED, STATUS_NEEDS_REVIEW, STATUS_CONFLICT, STATUS_LOGGED_ONLY,
@@ -366,17 +365,9 @@ def process_email(email: EmailInput):
         attachment_unparsed = False
 
         for att in email.attachments:
-            temp_path = None
             try:
                 file_bytes = base64.b64decode(att.data_base64)
-                # NOTE: still using a filename-based temp path here (not fixed
-                # in this pass — see the attachment race-condition/leak items
-                # from the review; flagging as a follow-up fix).
-                temp_path = f"temp_{att.filename}"
-                with open(temp_path, "wb") as f:
-                    f.write(file_bytes)
-
-                text, unparsed = extract_attachment_text(temp_path)
+                text, unparsed = save_and_extract(att.filename, io.BytesIO(file_bytes))
 
                 if unparsed:
                     attachment_unparsed = True
@@ -385,9 +376,6 @@ def process_email(email: EmailInput):
             except Exception as e:
                 attachment_unparsed = True
                 logger.error(f"Failed to process attachment {att.filename}: {e}")
-            finally:
-                if temp_path and os.path.exists(temp_path):
-                    os.remove(temp_path)
 
         combined_attachment_text = "\n\n".join(attachment_texts) if attachment_texts else None
 
@@ -421,17 +409,11 @@ def process_email_with_attachment(
 
     # See process_email: release the claim on any unexpected exception.
     try:
-        temp_path = f"temp_{file.filename}"
         attachment_text, attachment_unparsed = "", True
         try:
-            with open(temp_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-            attachment_text, attachment_unparsed = extract_attachment_text(temp_path)
+            attachment_text, attachment_unparsed = save_and_extract(file.filename, file.file)
         except Exception as e:
             logger.error(f"Failed to process attachment {file.filename}: {e}")
-        finally:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
 
         return run_pipeline(
             email_id=email_id,

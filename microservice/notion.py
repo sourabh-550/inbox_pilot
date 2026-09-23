@@ -3,10 +3,14 @@ from notion_client import Client
 from dotenv import load_dotenv
 
 from schemas import truncate_text
+from retry_utils import read_retry, write_retry
 
 load_dotenv()
 
-notion = Client(auth=os.environ.get("NOTION_TOKEN"))
+# The client's own retries are off: they'd wait up to 60s, aren't logged at
+# our level, and skip reads that use POST. Every call below goes through a
+# retry_utils policy instead.
+notion = Client(auth=os.environ.get("NOTION_TOKEN"), timeout_ms=10_000, retry=False)
 
 SOURCES_DB_ID = os.environ.get("NOTION_SOURCES_DB_ID")
 ITEMS_DB_ID = os.environ.get("NOTION_ITEMS_DB_ID")
@@ -21,8 +25,30 @@ STATUS_LOGGED_ONLY = "Logged only"
 ITEM_STATUSES = {STATUS_SCHEDULED, STATUS_NEEDS_REVIEW, STATUS_CONFLICT, STATUS_LOGGED_ONLY}
 
 
+@read_retry()
+def _retrieve_database(**kwargs):
+    return notion.databases.retrieve(**kwargs)
+
+
+@read_retry()
+def _query_data_source(**kwargs):
+    return notion.data_sources.query(**kwargs)
+
+
+@write_retry()
+def _create_page(**kwargs):
+    return notion.pages.create(**kwargs)
+
+
+# Only used to set a fixed status value, so repeating it is harmless and it
+# can use the read policy.
+@read_retry()
+def _update_page(**kwargs):
+    return notion.pages.update(**kwargs)
+
+
 def get_data_source_id(database_id: str) -> str:
-    db = notion.databases.retrieve(database_id=database_id)
+    db = _retrieve_database(database_id=database_id)
     return db["data_sources"][0]["id"]
 
 
@@ -35,7 +61,7 @@ def find_or_create_source(name: str) -> str:
     # was saved under its truncated form instead of creating a duplicate.
     name = truncate_text(name)
 
-    existing = notion.data_sources.query(
+    existing = _query_data_source(
         data_source_id=SOURCES_DATA_SOURCE_ID,
         filter={
             "property": "Name",
@@ -46,7 +72,7 @@ def find_or_create_source(name: str) -> str:
     if existing["results"]:
         return existing["results"][0]["id"]
 
-    new_source = notion.pages.create(
+    new_source = _create_page(
         parent={"type": "data_source_id", "data_source_id": SOURCES_DATA_SOURCE_ID},
         properties={
             "Name": {"title": [{"text": {"content": name}}]},
@@ -102,7 +128,7 @@ def create_item(
     if event_date:
         properties["event_date"] = {"date": {"start": event_date}}
 
-    new_item = notion.pages.create(
+    new_item = _create_page(
         parent={"type": "data_source_id", "data_source_id": ITEMS_DATA_SOURCE_ID},
         properties=properties
     )
@@ -111,7 +137,7 @@ def create_item(
 
 def update_item_status(page_id: str, status: str):
     _check_status(status)
-    notion.pages.update(
+    _update_page(
         page_id=page_id,
         properties={"status": {"select": {"name": status}}}
     )
@@ -148,7 +174,7 @@ def get_todays_items(start_iso: str, end_iso: str) -> list:
         if cursor:
             query_args["start_cursor"] = cursor
 
-        response = notion.data_sources.query(**query_args)
+        response = _query_data_source(**query_args)
         results.extend(response["results"])
 
         if response.get("has_more"):

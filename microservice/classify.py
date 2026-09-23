@@ -3,6 +3,7 @@ import json
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import httpx
 from groq import Groq
 from dotenv import load_dotenv
 
@@ -16,7 +17,14 @@ load_dotenv()
 
 logger = logging.getLogger("inboxpilot.classify")
 
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+# The SDK retries by itself (408/409/429/5xx, timeouts, connection errors)
+# and logs each retry at INFO, so there's no tenacity layer on top. Both
+# values are set explicitly; worst case is about 3 x 30s plus short backoffs.
+client = Groq(
+    api_key=os.environ.get("GROQ_API_KEY"),
+    timeout=httpx.Timeout(30.0, connect=5.0),
+    max_retries=2,
+)
 
 LOCAL_TZ = ZoneInfo("Asia/Kolkata")
 

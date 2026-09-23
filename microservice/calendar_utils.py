@@ -1,11 +1,25 @@
 import os
 from datetime import date, timedelta
+import httplib2
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
+from google_auth_httplib2 import AuthorizedHttp
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
+from retry_utils import read_retry, write_retry
+
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
+
+# Per-request timeout for Calendar calls and the token refresh (the library
+# defaults are 60s and 120s).
+CALENDAR_TIMEOUT_S = 10
+
+
+class _TimeoutRequest(Request):
+    """google-auth's token-refresh transport, with our timeout instead of 120s."""
+    def __call__(self, *args, timeout=CALENDAR_TIMEOUT_S, **kwargs):
+        return super().__call__(*args, timeout=timeout, **kwargs)
 
 
 def get_calendar_service():
@@ -16,7 +30,8 @@ def get_calendar_service():
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            # google-auth retries a failed refresh by itself (up to 3 attempts).
+            creds.refresh(_TimeoutRequest())
         else:
             flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
             creds = flow.run_local_server(port=0)
@@ -24,8 +39,21 @@ def get_calendar_service():
         with open("token.json", "w") as token_file:
             token_file.write(creds.to_json())
 
-    service = build("calendar", "v3", credentials=creds)
+    http = AuthorizedHttp(creds, http=httplib2.Http(timeout=CALENDAR_TIMEOUT_S))
+    service = build("calendar", "v3", http=http)
     return service
+
+
+@read_retry()
+def _query_freebusy(service, body: dict) -> dict:
+    return service.freebusy().query(body=body).execute()
+
+
+# Write policy: a timeout or 5xx isn't retried, because the event may already
+# exist and a retry would create a duplicate.
+@write_retry()
+def _insert_event(service, event: dict) -> dict:
+    return service.events().insert(calendarId="primary", body=event).execute()
 
 def check_conflict(start_datetime: str, end_datetime: str) -> list:
     """
@@ -41,7 +69,7 @@ def check_conflict(start_datetime: str, end_datetime: str) -> list:
         "items": [{"id": "primary"}]
     }
 
-    result = service.freebusy().query(body=body).execute()
+    result = _query_freebusy(service, body)
     busy_slots = result["calendars"]["primary"]["busy"]
     return busy_slots
 
@@ -76,7 +104,7 @@ def create_calendar_event(summary: str, start_datetime: str, end_datetime: str, 
         },
     }
 
-    created_event = service.events().insert(calendarId="primary", body=event).execute()
+    created_event = _insert_event(service, event)
     return created_event.get("htmlLink")
 
 
@@ -100,5 +128,5 @@ def create_all_day_event(summary: str, date_str: str, location: str = "", descri
         "transparency": "transparent",
     }
 
-    created_event = service.events().insert(calendarId="primary", body=event).execute()
+    created_event = _insert_event(service, event)
     return created_event.get("htmlLink")
