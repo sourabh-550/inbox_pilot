@@ -1,0 +1,4 @@
+# Reference copy of /etc/caddy/Caddyfile on EC2 (the real file uses the server's Elastic IP). Editing this file does not change the server.
+YOUR_SERVER_IP.nip.io {
+    reverse_proxy localhost:5678
+}
