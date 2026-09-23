@@ -1,9 +1,10 @@
 venv/
 .env
+.env.*
+!.env.example
 __pycache__/
 *.pyc
-.env.example
 credentials.json
 token*.json
-CLAUDE.md
 explanation.md
+CLAUDE.md
