@@ -1,4 +1,5 @@
 fastapi
+pydantic>=2
 uvicorn
 groq>=1.6.0
 pdfplumber

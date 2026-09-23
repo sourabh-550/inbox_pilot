@@ -2,6 +2,8 @@ import os
 from notion_client import Client
 from dotenv import load_dotenv
 
+from schemas import truncate_text
+
 load_dotenv()
 
 notion = Client(auth=os.environ.get("NOTION_TOKEN"))
@@ -29,6 +31,10 @@ ITEMS_DATA_SOURCE_ID = get_data_source_id(ITEMS_DB_ID)
 
 
 def find_or_create_source(name: str) -> str:
+    # Truncate before the lookup too, so a long name matches the Source that
+    # was saved under its truncated form instead of creating a duplicate.
+    name = truncate_text(name)
+
     existing = notion.data_sources.query(
         data_source_id=SOURCES_DATA_SOURCE_ID,
         filter={
@@ -78,17 +84,19 @@ def create_item(
 
     _check_status(status)
 
+    # Notion rejects a text value over 2000 characters, so every title and
+    # rich_text value goes through truncate_text.
     properties = {
-        "Title": {"title": [{"text": {"content": title}}]},
+        "Title": {"title": [{"text": {"content": truncate_text(title)}}]},
         "source": {"relation": [{"id": source_page_id}]},
         "category": {"select": {"name": category_map.get(category, "Other")}},
         "status": {"select": {"name": status}},
         "priority": {"select": {"name": priority.capitalize()}},
-        "location_or_link": {"rich_text": [{"text": {"content": location_or_link or ""}}]},
-        "source_email": {"rich_text": [{"text": {"content": source_email or ""}}]},
-        "attachment_summary": {"rich_text": [{"text": {"content": attachment_summary or ""}}]},
+        "location_or_link": {"rich_text": [{"text": {"content": truncate_text(location_or_link)}}]},
+        "source_email": {"rich_text": [{"text": {"content": truncate_text(source_email)}}]},
+        "attachment_summary": {"rich_text": [{"text": {"content": truncate_text(attachment_summary)}}]},
         "confidence_score": {"number": confidence_score},
-        "notes": {"rich_text": [{"text": {"content": notes or ""}}]}
+        "notes": {"rich_text": [{"text": {"content": truncate_text(notes)}}]}
     }
 
     if event_date:

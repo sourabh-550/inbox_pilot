@@ -1,11 +1,20 @@
 import os
 import json
+import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from groq import Groq
 from dotenv import load_dotenv
 
+# ClassificationError lives in schemas (importable without a Groq client);
+# re-exported here so `from classify import ClassificationError` still works.
+from schemas import (
+    ClassificationError, CLASSIFICATION_JSON_SCHEMA, validate_classification, truncate_text,
+)
+
 load_dotenv()
+
+logger = logging.getLogger("inboxpilot.classify")
 
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
@@ -15,17 +24,10 @@ LOCAL_TZ = ZoneInfo("Asia/Kolkata")
 # reasoning can use it up before any JSON is written.
 GROQ_MODEL = os.environ.get("GROQ_MODEL") or "openai/gpt-oss-120b"
 
-
-class ClassificationError(Exception):
-    """
-    Raised when the LLM's response can't be parsed as the expected JSON
-    object, or when the Groq call itself fails. Callers should catch this
-    and decide how to handle an email that couldn't be classified, rather
-    than letting it crash the request as an unhandled 500.
-    """
-    def __init__(self, message: str, raw_output: str = None):
-        super().__init__(message)
-        self.raw_output = raw_output
+# Caps on what goes into the prompt (about 4k tokens together), so a huge
+# email or attachment can't blow the context or Groq's rate limits.
+MAX_BODY_CHARS = 6000
+MAX_ATTACHMENT_CHARS = 10000
 
 SYSTEM_PROMPT_TEMPLATE = """You are an email classification and extraction assistant.
 Your job is to read an email (and optional attachment text) and return ONLY a JSON object — no explanation, no markdown formatting, no extra text.
@@ -74,7 +76,7 @@ Email subject: Interview Invitation - TechCorp
 Email body: We would like to invite you for an interview on August 10th at 3 PM via Google Meet.
 Sender: hr@techcorp.com
 Output:
-{{"category": "job_opportunity", "source_name": "TechCorp", "item_title": "Interview Invitation", "event_date": "2026-08-10T15:00:00", "location_or_link": "Google Meet", "priority": "high", "summary": "TechCorp invited the candidate for an interview on August 10th at 3 PM via Google Meet.", "flags": []}}
+{{"category": "meeting", "source_name": "TechCorp", "item_title": "Interview Invitation", "event_date": "2026-08-10T15:00:00", "location_or_link": "Google Meet", "priority": "high", "summary": "TechCorp invited the candidate for an interview on August 10th at 3 PM via Google Meet.", "flags": []}}
 
 Example 2:
 Email subject: Your Weekly Tech Digest
@@ -100,34 +102,17 @@ Output:
 Note: the dates in the examples above are illustrative only. They do NOT represent the current date. Always use the current date/time given at the top of this prompt to resolve any relative date language in the actual email you are classifying.
 """
 
-def classify_email(subject: str, body: str, sender: str, attachment_text: str = None):
-    now = datetime.now(LOCAL_TZ)
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-        current_datetime=now.strftime("%Y-%m-%d %H:%M:%S"),
-        current_day_name=now.strftime("%A")
-    )
+def _cap_for_prompt(text: str, limit: int, label: str) -> str:
+    capped = truncate_text(text, limit=limit, suffix="\n[truncated]")
+    if capped != text:
+        logger.warning(f"{label} cut from {len(text)} characters to the {limit}-character prompt limit")
+    return capped
 
-    user_content = f"Email subject: {subject}\nEmail body: {body}\nSender: {sender}"
-    if attachment_text:
-        user_content += f"\nAttachment text: {attachment_text}"
 
-    try:
-        response = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content}
-            ],
-            temperature=0,
-            reasoning_effort="low",
-            response_format={"type": "json_object"}
-        )
-    except Exception as e:
-        raise ClassificationError(f"Groq API call failed (model {GROQ_MODEL}): {e}")
-
-    raw_output = response.choices[0].message.content
-    finish_reason = response.choices[0].finish_reason
-
+def _parse_json(raw_output: str):
+    """
+    Returns the parsed JSON value, or None if nothing parseable was found.
+    """
     try:
         return json.loads(raw_output)
     except (json.JSONDecodeError, TypeError):
@@ -150,8 +135,59 @@ def classify_email(subject: str, body: str, sender: str, attachment_text: str = 
             except json.JSONDecodeError:
                 pass
 
-    raise ClassificationError(
-        f"Could not parse a valid JSON object from the model's response "
-        f"(model {GROQ_MODEL}, finish_reason {finish_reason})",
-        raw_output=raw_output
+    return None
+
+
+def classify_email(subject: str, body: str, sender: str, attachment_text: str = None):
+    now = datetime.now(LOCAL_TZ)
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+        current_datetime=now.strftime("%Y-%m-%d %H:%M:%S"),
+        current_day_name=now.strftime("%A")
     )
+
+    body = _cap_for_prompt(body, MAX_BODY_CHARS, "Email body")
+    user_content = f"Email subject: {subject}\nEmail body: {body}\nSender: {sender}"
+    if attachment_text:
+        attachment_text = _cap_for_prompt(attachment_text, MAX_ATTACHMENT_CHARS, "Attachment text")
+        user_content += f"\nAttachment text: {attachment_text}"
+
+    try:
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ],
+            temperature=0,
+            reasoning_effort="low",
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "email_classification",
+                    "strict": True,
+                    "schema": CLASSIFICATION_JSON_SCHEMA,
+                },
+            }
+        )
+    except Exception as e:
+        raise ClassificationError(f"Groq API call failed (model {GROQ_MODEL}): {e}")
+
+    raw_output = response.choices[0].message.content
+    finish_reason = response.choices[0].finish_reason
+
+    parsed = _parse_json(raw_output)
+    if parsed is None:
+        raise ClassificationError(
+            f"Could not parse a valid JSON object from the model's response "
+            f"(model {GROQ_MODEL}, finish_reason {finish_reason})",
+            raw_output=raw_output
+        )
+
+    # Strict mode should already guarantee the shape; this is the safety net.
+    try:
+        return validate_classification(parsed, raw_output=raw_output)
+    except ClassificationError as e:
+        raise ClassificationError(
+            f"{e} (model {GROQ_MODEL}, finish_reason {finish_reason})",
+            raw_output=raw_output
+        ) from e
