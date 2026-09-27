@@ -146,12 +146,34 @@ def _parse_json(raw_output: str):
     return None
 
 
-def classify_email(subject: str, body: str, sender: str, attachment_text: str = None):
-    now = datetime.now(LOCAL_TZ)
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+def build_system_prompt(now: datetime | None = None) -> str:
+    """
+    Fills SYSTEM_PROMPT_TEMPLATE with the "current" IST date and time, which
+    the model uses to resolve relative dates like "tomorrow".
+    - None -> the real current time (what production always uses)
+    - timezone-aware datetime -> converted to IST (for replaying old emails)
+    Raises TypeError if now isn't a datetime, and ValueError if it's naive,
+    since a naive time would silently be read as the wrong moment.
+    """
+    if now is None:
+        now = datetime.now(LOCAL_TZ)
+    elif not isinstance(now, datetime):
+        raise TypeError(f"now must be a datetime, got {type(now).__name__}")
+    elif now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError(f"now must be timezone-aware, got naive datetime {now.isoformat()}")
+    else:
+        now = now.astimezone(LOCAL_TZ)
+
+    return SYSTEM_PROMPT_TEMPLATE.format(
         current_datetime=now.strftime("%Y-%m-%d %H:%M:%S"),
         current_day_name=now.strftime("%A")
     )
+
+
+def classify_email(subject: str, body: str, sender: str, attachment_text: str = None,
+                   *, now: datetime | None = None):
+    # now is only for offline replay of old emails; main.py never passes it.
+    system_prompt = build_system_prompt(now)
 
     body = _cap_for_prompt(body, MAX_BODY_CHARS, "Email body")
     user_content = f"Email subject: {subject}\nEmail body: {body}\nSender: {sender}"
